@@ -364,6 +364,9 @@ extern void serialEventRun(void) __attribute__((weak));
 #endif  // ARDUINO_USB_CDC_ON_BOOT
 // There is always Seria0 for UART0
 extern HardwareSerial Serial0;
+#if PCB_VER < 50
+extern HardwareSerial Serial;
+#endif
 #if SOC_UART_NUM > 1
 extern HardwareSerial Serial1;
 #endif
