@@ -16,10 +16,17 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 using namespace fs;
 
 #define DEFAULT_FILE_BUFFER_SIZE 4096
+
+/* Runtime knobs (weak): firmware may provide strong defs and flip them at
+   runtime to A/B the stdio workarounds below (e.g. stock FATFS behaviour
+   during .srk update extraction vs the fast paths). */
+extern "C" __attribute__((weak)) bool g_vfsReadBypassOn = true;
+extern "C" __attribute__((weak)) uint32_t g_vfsWriteBufSize = DEFAULT_FILE_BUFFER_SIZE;
 
 FileImplPtr VFSImpl::open(const char *fpath, const char *mode, const bool create) {
   if (!_mountpoint) {
@@ -246,8 +253,8 @@ VFSFileImpl::VFSFileImpl(VFSImpl *fs, const char *fpath, const char *mode) : _fs
         if (!_f) {
           log_e("fopen(%s) failed", temp);
         }
-        if (_f && (_stat.st_blksize == 0)) {
-          setvbuf(_f, NULL, _IOFBF, DEFAULT_FILE_BUFFER_SIZE);
+        if (_f && (_stat.st_blksize == 0) && g_vfsWriteBufSize >= 1024) {
+          setvbuf(_f, NULL, _IOFBF, (int)g_vfsWriteBufSize);
         }
       } else if (S_ISDIR(_stat.st_mode)) {
         _isDirectory = true;
@@ -346,6 +353,34 @@ size_t VFSFileImpl::read(uint8_t *buf, size_t size) {
     return 0;
   }
 
+  /* newlib-nano's fread refills the stdio buffer in 1 KB chunks (BUFSIZ)
+     regardless of the configured buffer size. On SD-backed files every
+     1 KB refill becomes a tiny 2-sector SD command (~1 ms per-command
+     overhead) -> ~840 KB/s ceiling instead of the ~8 MB/s the bus can do.
+     For bulk reads (>= 1 KB) use pread() instead: it seeks at the FATFS
+     level (vfs_fat_pread), reads, and RESTORES the position -- the fd
+     never moves and newlib's FILE bookkeeping is never invalidated, so a
+     plain fseek(SEEK_CUR) afterwards advances the logical position
+     correctly. (An earlier ::read() bypass moved the fd behind newlib's
+     back and scrambled reads that followed buffered small reads -- that
+     bug destroyed .srk index reads: 12-byte header fread filled 1KB of
+     read-ahead, the raw read then started 1KB late.)
+     Small reads (byte-wise JSON parsing etc.) stay on the buffered path
+     where they usually cost zero syscalls from the warm stdio buffer. */
+   if (size >= 1024 && g_vfsReadBypassOn) {
+    long pos = ftell(_f);
+    if (pos < 0) {
+      return fread(buf, 1, size, _f);
+    }
+    ssize_t n = pread(fileno(_f), buf, size, (off_t)pos);
+    if (n <= 0) {
+      return 0;
+    }
+    if (fseek(_f, (long)n, SEEK_CUR) != 0) {
+      fseek(_f, pos + n, SEEK_SET); /* absolute resync fallback */
+    }
+    return n;
+  }
   return fread(buf, 1, size, _f);
 }
 
